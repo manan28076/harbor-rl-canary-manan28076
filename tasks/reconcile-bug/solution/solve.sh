@@ -1,5 +1,5 @@
 #!/bin/bash
-# Reference solution: replaces /app/reconcile.py with the version that fixes all 3 bugs.
+# Reference solution: replaces /app/reconcile.py with the version that fixes all bugs.
 cat > /app/reconcile.py <<'PYEOF'
 #!/usr/bin/env python3
 """Reconcile a CSV of payment transactions into a JSON summary."""
@@ -23,22 +23,29 @@ def parse_ts(raw):
     return dt.astimezone(timezone.utc)
 
 
+def parse_amount(raw):
+    """'$1,234.5678' -> Decimal rounded half-up to cents; not finite -> ValueError."""
+    amount = Decimal(raw.strip().lstrip("$").replace(",", ""))
+    if not amount.is_finite():
+        raise ValueError("not finite")
+    return amount.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+
 def load_rows(path):
     """Read well-formed rows; malformed rows are skipped."""
     rows = []
-    with open(path, newline="") as f:
+    with open(path, newline="", encoding="utf-8-sig") as f:
         for row in csv.DictReader(f):
             try:
-                amount = Decimal(row["amount"].strip())
                 rec = {
-                    "tx_id": row["tx_id"].strip(),
+                    "tx_id": row["tx_id"].strip().upper(),
                     "ts": parse_ts(row["timestamp"]),
-                    "amount": amount,
+                    "amount": parse_amount(row["amount"]),
                     "status": row["status"].strip().upper(),
                 }
             except (KeyError, AttributeError, ValueError, InvalidOperation):
                 continue
-            if rec["tx_id"] and amount.is_finite() and rec["status"] in STATUSES:
+            if rec["tx_id"] and rec["amount"].is_finite() and rec["status"] in STATUSES:
                 rows.append(rec)
     return rows
 

@@ -21,16 +21,15 @@ def load_rows(path):
     with open(path, newline="") as f:
         for row in csv.DictReader(f):
             try:
-                amount = Decimal(row["amount"].strip())
                 rec = {
                     "tx_id": row["tx_id"].strip(),
                     "ts": parse_ts(row["timestamp"]),
-                    "amount": amount,
+                    "amount": Decimal(row["amount"].strip()),
                     "status": row["status"].strip().upper(),
                 }
             except (KeyError, AttributeError, ValueError, InvalidOperation):
                 continue
-            if rec["tx_id"] and amount.is_finite() and rec["status"] in STATUSES:
+            if rec["tx_id"] and rec["amount"].is_finite() and rec["status"] in STATUSES:
                 rows.append(rec)
     return rows
 

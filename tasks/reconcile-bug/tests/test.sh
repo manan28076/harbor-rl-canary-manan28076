@@ -1,16 +1,22 @@
 #!/bin/bash
 # Dense + hardened verifier for the reconcile-bug task.
 #
-# Reward = 0.20*cli + 0.30*status + 0.50*dedupe   (each check is independent)
-#   cli    : wrong arg count -> usage on stderr + exit code 2 (no traceback)
-#   status : SUCCESS/FAILED/PENDING handling on two RANDOM unique-tx_id datasets
-#   dedupe : one record per tx_id (absolute instants incl. epoch secs; PENDING never replaces a final row) on two RANDOM datasets
+# reward = 0.20*cli + 0.30*status + 0.10*(time + rank + bom + money + idcase)
+#   cli    (0.20) Bug 1: wrong arg count -> `usage:` on stderr + exit 2, no traceback
+#   status (0.30) Bug 2: SUCCESS / FAILED / PENDING handling (unique tx_ids)
+#   Bug 3 = five independent input/dedupe sub-rules, 0.10 each (each uses its OWN isolated datasets):
+#     time   timestamps compared as absolute instants (UTC offsets, naive = UTC, Unix epoch seconds)
+#     rank   a PENDING row never replaces a final (SUCCESS/FAILED) row, even if later
+#     bom    the file may start with a UTF-8 BOM (and use CRLF line endings)
+#     money  amounts like "$1,234.50", >2 decimals, each rounded half-up to cents BEFORE summing
+#     idcase tx_id matching is case-insensitive and ignores surrounding spaces
 #
 # Anti-cheat:
-#   * every dataset is generated at verify time with os-level randomness -> no fixed answer to hardcode
+#   * every dataset is generated at verify time with os-level randomness -> nothing to hardcode
 #   * expected values come from the generator's own structured data, never from /app code
-#   * if two datasets with DIFFERENT expected answers produce IDENTICAL stdout, the script is
-#     ignoring its input -> total reward forced to 0.00
+#   * each dataset is built so the specific wrong behaviour it targets changes the answer
+#   * if two datasets with DIFFERENT expected answers produce the SAME non-trivial stdout, the script is
+#     ignoring its input (hardcoded stub) -> total reward forced to 0.00
 #   * fail closed: reward.txt starts at 0.00 and a verifier crash leaves it at 0.00
 set -u
 export APP_DIR="${APP_DIR:-/app}"
@@ -19,144 +25,211 @@ mkdir -p "$LOGS_DIR"
 echo "0.00" > "$LOGS_DIR/reward.txt"
 
 python3 - <<'PYEOF'
-import json, os, random, subprocess, sys, tempfile
+import csv, io, json, os, random, subprocess, sys, tempfile
 from datetime import datetime, timedelta, timezone
 from decimal import ROUND_HALF_UP, Decimal
 
 APP = os.environ["APP_DIR"]
 LOGS = os.environ["LOGS_DIR"]
 SCRIPT = os.path.join(APP, "reconcile.py")
-WEIGHTS = {"cli": 0.20, "status": 0.30, "dedupe": 0.50}
+WEIGHTS = {"cli": 0.20, "status": 0.30, "time": 0.10, "rank": 0.10, "bom": 0.10, "money": 0.10, "idcase": 0.10}
 rng = random.SystemRandom()
 DATA_DIR = os.path.join(LOGS, "data")
 os.makedirs(DATA_DIR, exist_ok=True)
-
-# ------------------------------------------------------------------ data generators
+CENT = Decimal("0.01")
 OFFSETS = ["Z", "+00:00", "+05:30", "-08:00", "+10:00", "-03:30", "+01:00", "naive"]
+BASE = datetime(2026, 3, 1, tzinfo=timezone.utc)
 
+# ------------------------------------------------------------------ small helpers
 def fmt_ts(utc_dt, off):
     """Return (timestamp string, wall-clock datetime as written)."""
-    if off == "epoch":                       # Unix epoch seconds -> UTC
+    if off == "epoch":
         return str(int(utc_dt.timestamp())), utc_dt
-    if off == "naive":                       # no offset -> must be read as UTC
+    if off == "naive":                           # no offset -> read as UTC
         return utc_dt.strftime("%Y-%m-%dT%H:%M:%S"), utc_dt
     if off == "Z":
         return utc_dt.strftime("%Y-%m-%dT%H:%M:%SZ"), utc_dt
     sign = 1 if off[0] == "+" else -1
-    delta = sign * timedelta(hours=int(off[1:3]), minutes=int(off[4:6]))
-    wall = utc_dt + delta
+    wall = utc_dt + sign * timedelta(hours=int(off[1:3]), minutes=int(off[4:6]))
     return wall.strftime("%Y-%m-%dT%H:%M:%S") + off, wall
 
 def rand_amount():
     return Decimal(rng.randint(100, 900000)) / 100
 
-def rand_instant(base, span_hours):
-    return base + timedelta(seconds=rng.randint(0, span_hours * 3600))
+def rand_instant(span_hours=48):
+    return (BASE + timedelta(seconds=rng.randint(0, span_hours * 3600))).replace(second=0)
 
-def expected_from(records):
-    """records: dicts with tx_id, key (sortable), status, amount. Latest key wins."""
-    latest = {}
-    for r in records:
-        cur = latest.get(r["tx_id"])
-        if cur is None or r["key"] >= cur["key"]:
-            latest[r["tx_id"]] = r
+def new_ids(n):
+    return [f"TX{i}" for i in rng.sample(range(100000, 999999), n)]
+
+def to_bytes(rows, bom=False, crlf=False):
+    buf = io.StringIO()
+    w = csv.writer(buf, lineterminator="\r\n" if crlf else "\n")
+    w.writerow(["tx_id", "timestamp", "amount", "status"])
+    for r in rows:
+        w.writerow(r)
+    data = buf.getvalue().encode("utf-8")
+    return (b"\xef\xbb\xbf" + data) if bom else data
+
+def totals(records):
+    """records: dicts with status + amount (already the amount that should count)."""
     total, valid, failed = Decimal("0"), 0, 0
-    for r in latest.values():
+    for r in records:
         if r["status"] == "SUCCESS":
             valid += 1; total += r["amount"]
         elif r["status"] == "FAILED":
             failed += 1
-    total = total.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
-    return {"total": float(total), "valid_count": valid, "failed_count": failed}
+    return {"total": float(total.quantize(CENT, rounding=ROUND_HALF_UP)), "valid_count": valid, "failed_count": failed}
 
-def disguise(status):
-    return rng.choice([status, status.lower(), status.title(), f" {status} "])
+def survivors(recs, key):
+    """One record per group id: highest key wins (ties -> later row, because key ends with the row index)."""
+    best = {}
+    for r in recs:
+        k = key(r)
+        g = r["group"]
+        if g not in best or k >= best[g][0]:
+            best[g] = (k, r)
+    return totals([v[1] for v in best.values()])
 
-def make_status_dataset():
-    """Unique tx_ids, mixed SUCCESS/FAILED/PENDING, mixed offsets. No duplicates -> isolates the status rule."""
+MALFORMED = lambda victim: [
+    ["BAD1", "2026-03-01T10:00:00Z", "abc", "SUCCESS"], ["BAD2", "", "10.00", "SUCCESS"],
+    ["", "2026-03-01T10:00:00Z", "10.00", "SUCCESS"], ["BAD3", "not-a-date", "10.00", "SUCCESS"],
+    ["BAD4", "2026-03-01T10:00:00Z", "10.00", "REFUNDED"], ["BAD5", "2026-03-01T10:00:00Z"],
+    [victim, "2027-01-01T00:00:00Z", "oops", "FAILED"],
+]
+
+# ------------------------------------------------------------------ dataset generators (each returns (bytes, expected))
+def make_status():
+    """Unique tx_ids, SUCCESS/FAILED/PENDING (odd casing/spaces). Isolates Bug 2."""
     while True:
-        n = rng.randint(25, 40)
-        ids = rng.sample(range(100000, 999999), n)
-        base = datetime(2026, 1, 1, tzinfo=timezone.utc)
-        lines, recs = [], []
-        for i, tid in enumerate(ids):
+        ids = new_ids(rng.randint(25, 40))
+        rows, recs = [], []
+        for tid in ids:
             st = rng.choices(["SUCCESS", "FAILED", "PENDING"], [4, 3, 3])[0]
             amt = rand_amount()
-            ts, _ = fmt_ts(rand_instant(base, 24 * 90), rng.choice(OFFSETS))
-            lines.append(f"TX{tid},{ts},{amt},{disguise(st)}")
-            recs.append({"tx_id": f"TX{tid}", "key": i, "status": st, "amount": amt})
-        pend = sum(1 for r in recs if r["status"] == "PENDING")
-        succ = sum(1 for r in recs if r["status"] == "SUCCESS")
-        fail = sum(1 for r in recs if r["status"] == "FAILED")
-        if pend >= 3 and succ >= 3 and fail >= 3:
-            return "tx_id,timestamp,amount,status\n" + "\n".join(lines) + "\n", expected_from(recs)
+            ts, _ = fmt_ts(BASE + timedelta(seconds=rng.randint(0, 90 * 86400)), rng.choice(OFFSETS))
+            rows.append([tid, ts, f"{amt}", rng.choice([st, st.lower(), st.title(), f" {st} "])])
+            recs.append({"group": tid, "status": st, "amount": amt})
+        cnt = {s: sum(r["status"] == s for r in recs) for s in ("SUCCESS", "FAILED", "PENDING")}
+        if min(cnt.values()) >= 3:
+            return to_bytes(rows), totals([r for r in recs])
 
-def survivors(good, tz_ok=True, epoch_ok=True, rule_c=True):
-    """Expected answer, optionally simulating ONE specific wrong implementation."""
-    recs = []
-    for i, r in good:
-        if r["epoch"] and not epoch_ok:          # epoch timestamps treated as malformed
-            continue
-        t = r["inst"] if tz_ok else r["wall"]    # wall-clock instead of absolute instant
-        final = (r["status"] != "PENDING") if rule_c else True
-        recs.append({**r, "key": (final, t, i)})
-    return expected_from(recs)
-
-def make_dedupe_dataset():
-    """Duplicate tx_ids across timezones / epoch seconds, later PENDING rows, malformed rows.
-    No PENDING-only tx_id exists, so the status rule cannot influence this check.
-    Each of the three sub-rules (absolute instants, epoch seconds, PENDING never supersedes
-    a final row) must change the answer, so fixing only some of them cannot pass."""
+def make_time():
+    """Duplicates written in mixed UTC offsets / naive / Unix epoch seconds + malformed rows. Isolates 'time'."""
     for _ in range(300):
-        base = datetime(2026, 3, 1, tzinfo=timezone.utc)
-        rows = []  # (line, record-or-None)
-        n_tx = rng.randint(12, 18)
-        ids = rng.sample(range(100000, 999999), n_tx)
+        items, ids = [], new_ids(rng.randint(12, 18))
         for tid in ids:
-            k = rng.randint(1, 4)
-            instants = set()
-            while len(instants) < k:
-                instants.add(rand_instant(base, 48).replace(second=0))
-            for inst in instants:
+            insts = set()
+            while len(insts) < rng.randint(1, 4):
+                insts.add(rand_instant())
+            for inst in insts:
                 off = rng.choice(OFFSETS + ["epoch", "epoch"])
-                ts, wall = fmt_ts(inst, off)
-                st, amt = rng.choice(["SUCCESS", "FAILED"]), rand_amount()
-                rows.append((f"TX{tid},{ts},{amt},{st}",
-                             {"tx_id": f"TX{tid}", "inst": inst, "wall": wall, "status": st,
-                              "amount": amt, "epoch": off == "epoch"}))
-            if rng.random() < 0.45:              # a PENDING retry logged AFTER every final row
-                inst = max(instants) + timedelta(minutes=rng.randint(5, 600))
-                off = rng.choice(OFFSETS + ["epoch"])
-                ts, wall = fmt_ts(inst, off); amt = rand_amount()
-                rows.append((f"TX{tid},{ts},{amt},PENDING",
-                             {"tx_id": f"TX{tid}", "inst": inst, "wall": wall, "status": "PENDING",
-                              "amount": amt, "epoch": off == "epoch"}))
-        # deliberate same-instant tie written with different offsets: the LATER row in the file wins
-        tie_id = f"TX{rng.choice([x for x in range(100000, 999999) if x not in ids])}"
-        tie_inst = rand_instant(base, 48).replace(second=0)
+                ts, wall = fmt_ts(inst, off); amt = rand_amount(); st = rng.choice(["SUCCESS", "FAILED"])
+                items.append(([tid, ts, f"{amt}", st],
+                              {"group": tid, "status": st, "amount": amt, "inst": inst, "wall": wall, "epoch": off == "epoch"}))
+        tie_id = new_ids(1)[0]; tie_inst = rand_instant()          # same instant, different offsets: later row wins
         for off, st in zip(rng.sample(["+05:30", "Z", "-08:00", "+10:00"], 2), ["SUCCESS", "FAILED"]):
             ts, wall = fmt_ts(tie_inst, off); amt = rand_amount()
-            rows.append((f"{tie_id},{ts},{amt},{st}",
-                         {"tx_id": tie_id, "inst": tie_inst, "wall": wall, "status": st,
-                          "amount": amt, "epoch": False}))
-        rng.shuffle(rows)
-        # malformed rows (must be skipped entirely, even if they share a tx_id with a good row)
-        victim = rng.choice(ids)
-        bad = [
-            "BAD1,2026-03-01T10:00:00Z,abc,SUCCESS", "BAD2,,10.00,SUCCESS",
-            ",2026-03-01T10:00:00Z,10.00,SUCCESS", "BAD3,not-a-date,10.00,SUCCESS",
-            "BAD4,2026-03-01T10:00:00Z,10.00,REFUNDED", "BAD5,2026-03-01T10:00:00Z",
-            f"TX{victim},2027-01-01T00:00:00Z,oops,FAILED",
-        ]
-        for b_ in bad:
-            rows.insert(rng.randint(0, len(rows)), (b_, None))
-        good = [(i, r) for i, (_, r) in enumerate(rows) if r is not None]
-        exp = survivors(good)
-        wrong = [survivors(good, tz_ok=False), survivors(good, epoch_ok=False),
-                 survivors(good, rule_c=False)]
-        if all(exp != w for w in wrong):         # every sub-rule must matter
-            return "tx_id,timestamp,amount,status\n" + "\n".join(l for l, _ in rows) + "\n", exp
-    raise RuntimeError("could not build a discriminating dedupe dataset")
+            items.append(([tie_id, ts, f"{amt}", st],
+                          {"group": tie_id, "status": st, "amount": amt, "inst": tie_inst, "wall": wall, "epoch": False}))
+        rng.shuffle(items)
+        for b in MALFORMED(rng.choice(ids)):
+            items.insert(rng.randint(0, len(items)), (b, None))
+        good = [(i, r) for i, (_, r) in enumerate(items) if r is not None]
+        idx = {id(r): i for i, r in good}
+        exp = survivors([r for _, r in good], lambda r: (r["inst"], idx[id(r)]))
+        wrong_tz = survivors([r for _, r in good], lambda r: (r["wall"], idx[id(r)]))
+        wrong_epoch = survivors([r for _, r in good if not r["epoch"]], lambda r: (r["inst"], idx[id(r)]))
+        if exp != wrong_tz and exp != wrong_epoch:
+            return to_bytes([row for row, _ in items]), exp
+    raise RuntimeError("time dataset")
+
+def make_rank():
+    """Z timestamps only. Some tx_ids get a LATER PENDING retry after their final row. Isolates 'rank'."""
+    for _ in range(300):
+        items = []
+        for tid in new_ids(rng.randint(12, 18)):
+            insts = set()
+            while len(insts) < rng.randint(1, 3):
+                insts.add(rand_instant())
+            for inst in insts:
+                ts, _ = fmt_ts(inst, "Z"); amt = rand_amount(); st = rng.choice(["SUCCESS", "FAILED"])
+                items.append(([tid, ts, f"{amt}", st], {"group": tid, "status": st, "amount": amt, "inst": inst}))
+            if rng.random() < 0.6:
+                inst = max(insts) + timedelta(minutes=rng.randint(5, 600)) if rng.random() < 0.8 else min(insts) - timedelta(minutes=30)
+                ts, _ = fmt_ts(inst, "Z"); amt = rand_amount()
+                items.append(([tid, ts, f"{amt}", "PENDING"], {"group": tid, "status": "PENDING", "amount": amt, "inst": inst}))
+        rng.shuffle(items)
+        idx = {id(r): i for i, (_, r) in enumerate(items)}
+        recs = [r for _, r in items]
+        exp = survivors(recs, lambda r: (r["status"] != "PENDING", r["inst"], idx[id(r)]))
+        wrong = survivors(recs, lambda r: (r["inst"], idx[id(r)]))
+        if exp != wrong:
+            return to_bytes([row for row, _ in items]), exp
+    raise RuntimeError("rank dataset")
+
+def make_bom():
+    """Plain unique rows, but the file starts with a UTF-8 BOM and uses CRLF line endings. Isolates 'bom'."""
+    while True:
+        rows, recs = [], []
+        for tid in new_ids(rng.randint(15, 25)):
+            st = rng.choice(["SUCCESS", "FAILED"]); amt = rand_amount()
+            ts, _ = fmt_ts(rand_instant(), "Z")
+            rows.append([tid, ts, f"{amt}", st]); recs.append({"group": tid, "status": st, "amount": amt})
+        exp = totals(recs)
+        if exp["valid_count"] >= 3 and exp["failed_count"] >= 3:
+            return to_bytes(rows, bom=True, crlf=True), exp
+
+def make_money():
+    """Unique rows; amounts like "$1,234.50", 3-4 decimals and exact .xx5 ties. Isolates 'money'."""
+    for _ in range(300):
+        rows, eff, raw_recs, fmt_only = [], [], [], []
+        for tid in new_ids(rng.randint(18, 26)):
+            st = rng.choices(["SUCCESS", "FAILED"], [7, 3])[0]
+            d = rng.choice([2, 2, 3, 4])
+            raw = Decimal(rng.randint(1, 3000000)) / (Decimal(10) ** d)
+            if rng.random() < 0.25:
+                raw = Decimal(rng.randint(1, 99999)) / 100 + Decimal("0.005")     # exact tie, must round UP
+            s = format(raw, "f")
+            if raw >= 1000 and rng.random() < 0.6:
+                s = format(raw, ",f")
+            if rng.random() < 0.4:
+                s = "$" + s
+            q = raw.quantize(CENT, rounding=ROUND_HALF_UP)
+            ts, _ = fmt_ts(rand_instant(), "Z")
+            rows.append([tid, ts, s, st])
+            eff.append({"group": tid, "status": st, "amount": q})
+            raw_recs.append({"group": tid, "status": st, "amount": raw})
+            fmt_only.append(("$" in s or "," in s))
+        exp = totals(eff)
+        no_round = totals(raw_recs)                                    # sum first, round once at the end
+        no_format = totals([r for r, f in zip(eff, fmt_only) if not f])  # $ / comma rows treated as malformed
+        if exp != no_round and exp != no_format:
+            return to_bytes(rows), exp
+    raise RuntimeError("money dataset")
+
+def make_idcase():
+    """Same transaction written as TX123 / tx123 / ' Tx123 '. Z timestamps, plain amounts. Isolates 'idcase'."""
+    for _ in range(300):
+        items = []
+        for tid in new_ids(rng.randint(10, 14)):
+            insts = set()
+            while len(insts) < rng.randint(2, 4):
+                insts.add(rand_instant())
+            for inst in insts:
+                ts, _ = fmt_ts(inst, "Z"); amt = rand_amount(); st = rng.choice(["SUCCESS", "FAILED"])
+                raw_id = rng.choice([tid, tid.lower(), f" {tid} ", "Tx" + tid[2:]])
+                items.append(([raw_id, ts, f"{amt}", st],
+                              {"group": tid, "raw": raw_id.strip(), "status": st, "amount": amt, "inst": inst}))
+        rng.shuffle(items)
+        for i, (_, r) in enumerate(items):
+            r["i"] = i
+        recs = [r for _, r in items]
+        exp = survivors(recs, lambda r: (r["inst"], r["i"]))
+        wrong = survivors([{**r, "group": r["raw"]} for r in recs], lambda r: (r["inst"], r["i"]))
+        if exp != wrong:
+            return to_bytes([row for row, _ in items]), exp
+    raise RuntimeError("idcase dataset")
 
 # ------------------------------------------------------------------ running + comparing
 def run(args):
@@ -180,46 +253,53 @@ def matches(stdout, exp):
     except Exception:
         return False
 
-def write_dataset(name, text):
+def write_dataset(name, data):
     path = os.path.join(DATA_DIR, name)
-    with open(path, "w", newline="") as f:
-        f.write(text)
+    with open(path, "wb") as f:
+        f.write(data)
     return path
 
-# ------------------------------------------------------------------ the checks
 results, outputs = {}, []          # outputs: (expected, stdout) pairs for the anti-cheat invariant
 
-# check 1: CLI contract (independent of every other check)
-sample, _ = make_status_dataset()
+def two(gen, name):
+    """Run on two independent random datasets; both must match."""
+    ok = True
+    for i in range(2):
+        data, exp = gen()
+        rc, out, _ = run([write_dataset(f"{name}_{i}.csv", data)])
+        outputs.append((exp, out))
+        ok = ok and rc == 0 and matches(out, exp)
+    return ok
+
+# check 1: CLI contract
+sample, _ = make_status()
 p1 = write_dataset("cli_sample.csv", sample)
 rc0, _, err0 = run([])
 rc2, _, err2 = run([p1, "extra-arg"])
 results["cli"] = (rc0 == 2 and "usage" in err0.lower() and "Traceback" not in err0
                   and rc2 == 2 and "Traceback" not in err2)
+# checks 2-7
+results["status"] = two(make_status, "status")
+results["time"] = two(make_time, "time")
+results["rank"] = two(make_rank, "rank")
+results["bom"] = two(make_bom, "bom")
+results["money"] = two(make_money, "money")
+results["idcase"] = two(make_idcase, "idcase")
 
-# check 2: status rules (two random datasets, both must match)
-ok = True
-for i in range(2):
-    text, exp = make_status_dataset()
-    rc, out, _ = run([write_dataset(f"status_{i}.csv", text)])
-    outputs.append((exp, out))
-    ok = ok and rc == 0 and matches(out, exp)
-results["status"] = ok
+# anti-cheat: the SAME non-trivial answer printed for datasets whose correct answers differ => the script
+# ignores its input (a hardcoded stub). All-zero output is NOT flagged: an honest-but-broken script that skips
+# every row (e.g. cannot read a BOM header) legitimately prints zeros and simply fails those checks.
+def nontrivial(stdout):
+    try:
+        o = json.loads(stdout)
+        return bool(o.get("valid_count") or o.get("failed_count") or o.get("total_valid_amount"))
+    except Exception:
+        return False
 
-# check 3: dedupe (instants, epoch, PENDING rule) + malformed rows (two random datasets, both must match)
-ok = True
-for i in range(2):
-    text, exp = make_dedupe_dataset()
-    rc, out, _ = run([write_dataset(f"dedupe_{i}.csv", text)])
-    outputs.append((exp, out))
-    ok = ok and rc == 0 and matches(out, exp)
-results["dedupe"] = ok
-
-# anti-cheat: identical stdout for datasets with different answers => script ignores its input
 cheat = False
 for a in range(len(outputs)):
     for b in range(a + 1, len(outputs)):
-        if outputs[a][0] != outputs[b][0] and outputs[a][1].strip() and outputs[a][1] == outputs[b][1]:
+        if outputs[a][0] != outputs[b][0] and outputs[a][1] == outputs[b][1] and nontrivial(outputs[a][1]):
             cheat = True
 
 score = 0.0 if cheat else round(sum(WEIGHTS[k] for k, v in results.items() if v), 2)
