@@ -1,13 +1,14 @@
 #!/bin/bash
 # Dense + hardened verifier for the reconcile-bug task.
 #
-# reward = 0.20*cli + 0.30*status + 0.10*(time + rank + bom + money + idcase)
-#   cli    (0.20) Bug 1: wrong arg count -> `usage:` on stderr + exit 2, no traceback
-#   status (0.30) Bug 2: SUCCESS / FAILED / PENDING handling (unique tx_ids)
-#   Bug 3 = five independent input/dedupe sub-rules, 0.10 each (each uses its OWN isolated datasets):
-#     time   timestamps compared as absolute instants (UTC offsets, naive = UTC, Unix epoch seconds)
+# reward = 0.15*cli + 0.25*status + 0.10*(time + epoch + rank + bom + money + idcase)
+#   cli    (0.15) Bug 1: wrong arg count -> `usage:` on stderr + exit 2, no traceback
+#   status (0.25) Bug 2: SUCCESS / FAILED / PENDING handling (unique tx_ids)
+#   Bug 3 = six independent input/dedupe sub-rules, 0.10 each (each uses its OWN isolated datasets):
+#     time   timestamps compared as absolute instants (mixed UTC offsets, naive = UTC)
+#     epoch  some upstream systems write timestamps as Unix epoch seconds
 #     rank   a PENDING row never replaces a final (SUCCESS/FAILED) row, even if later
-#     bom    the file may start with a UTF-8 BOM (and use CRLF line endings)
+#     bom    the file starts with a UTF-8 BOM (spreadsheet export) and uses CRLF line endings
 #     money  amounts like "$1,234.50", >2 decimals, each rounded half-up to cents BEFORE summing
 #     idcase tx_id matching is case-insensitive and ignores surrounding spaces
 #
@@ -32,7 +33,7 @@ from decimal import ROUND_HALF_UP, Decimal
 APP = os.environ["APP_DIR"]
 LOGS = os.environ["LOGS_DIR"]
 SCRIPT = os.path.join(APP, "reconcile.py")
-WEIGHTS = {"cli": 0.20, "status": 0.30, "time": 0.10, "rank": 0.10, "bom": 0.10, "money": 0.10, "idcase": 0.10}
+WEIGHTS = {"cli": 0.15, "status": 0.25, "time": 0.10, "epoch": 0.10, "rank": 0.10, "bom": 0.10, "money": 0.10, "idcase": 0.10}
 rng = random.SystemRandom()
 DATA_DIR = os.path.join(LOGS, "data")
 os.makedirs(DATA_DIR, exist_ok=True)
@@ -115,7 +116,7 @@ def make_status():
             return to_bytes(rows), totals([r for r in recs])
 
 def make_time():
-    """Duplicates written in mixed UTC offsets / naive / Unix epoch seconds + malformed rows. Isolates 'time'."""
+    """Duplicates written in mixed UTC offsets / naive timestamps + malformed rows. Isolates 'time'."""
     for _ in range(300):
         items, ids = [], new_ids(rng.randint(12, 18))
         for tid in ids:
@@ -123,7 +124,7 @@ def make_time():
             while len(insts) < rng.randint(1, 4):
                 insts.add(rand_instant())
             for inst in insts:
-                off = rng.choice(OFFSETS + ["epoch", "epoch"])
+                off = rng.choice(OFFSETS)
                 ts, wall = fmt_ts(inst, off); amt = rand_amount(); st = rng.choice(["SUCCESS", "FAILED"])
                 items.append(([tid, ts, f"{amt}", st],
                               {"group": tid, "status": st, "amount": amt, "inst": inst, "wall": wall, "epoch": off == "epoch"}))
@@ -139,10 +140,32 @@ def make_time():
         idx = {id(r): i for i, r in good}
         exp = survivors([r for _, r in good], lambda r: (r["inst"], idx[id(r)]))
         wrong_tz = survivors([r for _, r in good], lambda r: (r["wall"], idx[id(r)]))
-        wrong_epoch = survivors([r for _, r in good if not r["epoch"]], lambda r: (r["inst"], idx[id(r)]))
-        if exp != wrong_tz and exp != wrong_epoch:
+        if exp != wrong_tz:
             return to_bytes([row for row, _ in items]), exp
     raise RuntimeError("time dataset")
+
+def make_epoch():
+    """Duplicates mixing ISO 'Z' timestamps and Unix epoch seconds. Isolates 'epoch'."""
+    for _ in range(300):
+        items = []
+        for tid in new_ids(rng.randint(12, 18)):
+            insts = set()
+            while len(insts) < rng.randint(2, 4):
+                insts.add(rand_instant())
+            for inst in insts:
+                off = rng.choice(["Z", "epoch"])
+                ts, _ = fmt_ts(inst, off); amt = rand_amount(); st = rng.choice(["SUCCESS", "FAILED"])
+                items.append(([tid, ts, f"{amt}", st],
+                              {"group": tid, "status": st, "amount": amt, "inst": inst, "epoch": off == "epoch"}))
+        rng.shuffle(items)
+        for i, (_, r) in enumerate(items):
+            r["i"] = i
+        recs = [r for _, r in items]
+        exp = survivors(recs, lambda r: (r["inst"], r["i"]))
+        wrong = survivors([r for r in recs if not r["epoch"]], lambda r: (r["inst"], r["i"]))   # epoch rows skipped
+        if exp != wrong:
+            return to_bytes([row for row, _ in items]), exp
+    raise RuntimeError("epoch dataset")
 
 def make_rank():
     """Z timestamps only. Some tx_ids get a LATER PENDING retry after their final row. Isolates 'rank'."""
@@ -281,6 +304,7 @@ results["cli"] = (rc0 == 2 and "usage" in err0.lower() and "Traceback" not in er
 # checks 2-7
 results["status"] = two(make_status, "status")
 results["time"] = two(make_time, "time")
+results["epoch"] = two(make_epoch, "epoch")
 results["rank"] = two(make_rank, "rank")
 results["bom"] = two(make_bom, "bom")
 results["money"] = two(make_money, "money")
