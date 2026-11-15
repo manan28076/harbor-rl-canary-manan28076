@@ -64,3 +64,7 @@ has to cope with real-world exports, not only tidy ones.
   number with at most 2 decimal places.
 * `valid_count`, `failed_count` — JSON integers.
 * No other keys.
+
+## Sample input
+
+A small sample exported from production is available at `/app/sample_transactions.csv`. It has no expected output: run your fixed script on it and sanity-check the result against the rules above before you finish.
