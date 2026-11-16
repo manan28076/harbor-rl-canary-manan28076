@@ -1,0 +1,44 @@
+{
+    "schema_version": 1,
+    "id": "02933bc2-d44c-4c17-93e2-fd3a4430620a",
+    "started_at": "2026-11-15T22:13:47.961593",
+    "updated_at": "2026-11-15T22:17:33.792725",
+    "finished_at": "2026-11-15T22:17:33.792725",
+    "n_total_trials": 3,
+    "stats": {
+        "n_completed_trials": 3,
+        "n_errored_trials": 0,
+        "n_running_trials": 0,
+        "n_pending_trials": 0,
+        "n_cancelled_trials": 0,
+        "n_retries": 0,
+        "evals": {
+            "terminus-2__gemini-flash-lite-latest__adhoc": {
+                "n_trials": 3,
+                "n_errors": 0,
+                "metrics": [
+                    {
+                        "mean": 0.8333333333333334
+                    }
+                ],
+                "pass_at_k": {},
+                "reward_stats": {
+                    "reward": {
+                        "0.8": [
+                            "reconcile-bug__xTacK4N",
+                            "reconcile-bug__FCyd5kv"
+                        ],
+                        "0.9": [
+                            "reconcile-bug__b6FPAf7"
+                        ]
+                    }
+                },
+                "exception_stats": {}
+            }
+        },
+        "n_input_tokens": 200914,
+        "n_cache_tokens": 109696,
+        "n_output_tokens": 21056,
+        "cost_usd": 0.08329628
+    }
+}
