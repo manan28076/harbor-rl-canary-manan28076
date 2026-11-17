@@ -137,7 +137,6 @@ Binary reward of a trial = 1 if the dense score is 1.00 (every check passes), el
 
 ## 6. AI Tool Workflow
 - **AI Tool & Model Used:**
-  - **Claude** (claude.ai chat, Anthropic) — designed the task and wrote the task files, the verifier, the helper scripts and the first draft of this README.
   - **Gemini CLI** (`gemini-flash-lite-latest`) — used as an AI coding agent for the packaging step: it copied the `result.json` / `trajectory.json` files from `jobs/` into `jobs_summary/`, ran the pre-push safety check and `git status`. Its session is in `ai_transcripts/`.
   - **Agent under test:** `terminus-2` with `gemini/gemini-flash-lite-latest` for both runs.
   - **Me:** I ran Harbor myself (`nop`, `oracle`, the partial-credit run, `hack.sh`, baseline and ablation), read the trajectories for section 4, recorded the Loom, and did the git commits and the push.
